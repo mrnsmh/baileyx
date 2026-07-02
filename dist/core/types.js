@@ -1,0 +1,30 @@
+export const DEFAULT_CONFIG = {
+    authDir: './auth',
+    sessionId: 'default',
+    preset: 'balanced',
+    maxPerMinute: 10,
+    maxPerHour: 100,
+    maxPerDay: 500,
+    minDelayMs: 1200,
+    maxDelayMs: 5400,
+    warmupDays: 7,
+    warmupDay1Limit: 20,
+    warmupGrowthFactor: 1.8,
+    autoPauseAt: 'high',
+    typingIndicators: true,
+    readReceipts: true,
+    presenceUpdates: true,
+    logLevel: 'info',
+    api: {
+        enabled: false,
+        port: 3010,
+        host: '0.0.0.0',
+    },
+    mcp: {
+        enabled: false,
+        transport: 'stdio',
+        port: 3011,
+    },
+    webhooks: {},
+};
+//# sourceMappingURL=types.js.map

@@ -1,0 +1,53 @@
+{
+  "name": "@whtsp/core",
+  "version": "0.1.0",
+  "description": "Reinforced Baileys wrapper with anti-ban, REST API, MCP, and JSON config",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "whtsp": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./api": {
+      "types": "./dist/api/index.d.ts",
+      "import": "./dist/api/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/index.d.ts",
+      "import": "./dist/mcp/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/cli.js",
+    "start:api": "node dist/cli.js --api",
+    "start:mcp": "node dist/cli.js --mcp"
+  },
+  "dependencies": {
+    "baileys": "^7.0.0-rc.13",
+    "pino": "^9.0.0",
+    "express": "^4.21.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "baileys": ">=7.0.0-rc.0"
+  }
+}
