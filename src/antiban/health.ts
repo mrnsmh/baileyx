@@ -5,6 +5,8 @@ interface HealthConfig {
   maxDisconnectsPerHour: number
   maxFailedMessagesPerHour: number
   maxForbiddenErrors: number
+  /** Low delivery rate threshold (0-1). Default: 0.6 */
+  lowDeliveryRateThreshold: number
 }
 
 const RISK_ORDER: BanRiskLevel[] = ['low', 'medium', 'high', 'critical']
@@ -16,6 +18,7 @@ export class HealthMonitor {
   private failedMessageTimestamps: number[] = []
   private forbiddenCount = 0
   private startTime: number
+  private deliveryTracker = new Map<string, boolean>() // messageId -> delivered
 
   constructor(config: Partial<HealthConfig> = {}) {
     this.config = {
@@ -23,6 +26,7 @@ export class HealthMonitor {
       maxDisconnectsPerHour: config.maxDisconnectsPerHour ?? 5,
       maxFailedMessagesPerHour: config.maxFailedMessagesPerHour ?? 10,
       maxForbiddenErrors: config.maxForbiddenErrors ?? 3,
+      lowDeliveryRateThreshold: config.lowDeliveryRateThreshold ?? 0.6,
     }
     this.startTime = Date.now()
     this.status = {
@@ -75,6 +79,13 @@ export class HealthMonitor {
       }
     }
 
+    // Delivery receipt rate
+    const deliveryRate = this.getDeliveryRate()
+    if (deliveryRate < this.config.lowDeliveryRateThreshold && this.deliveryTracker.size >= 10) {
+      score += 25
+      reasons.push(`low delivery rate: ${(deliveryRate * 100).toFixed(1)}%`)
+    }
+
     // Success decay: reduce score based on successful messages
     if (this.status.successfulMessages > 0 && score > 0) {
       const decay = Math.min(score, Math.floor(this.status.successfulMessages / 10))
@@ -120,6 +131,32 @@ export class HealthMonitor {
   onForbidden(): void {
     this.forbiddenCount++
     this.computeRisk()
+  }
+
+  /**
+   * Record a message sent for delivery tracking.
+   */
+  onMessageSent(messageId: string): void {
+    this.deliveryTracker.set(messageId, false)
+  }
+
+  /**
+   * Record a delivery receipt (double-tick).
+   */
+  onDeliveryReceipt(messageId: string): void {
+    if (this.deliveryTracker.has(messageId)) {
+      this.deliveryTracker.set(messageId, true)
+    }
+  }
+
+  /**
+   * Get delivery rate (0-1).
+   */
+  getDeliveryRate(): number {
+    const total = this.deliveryTracker.size
+    if (total < 10) return 1.0
+    const delivered = [...this.deliveryTracker.values()].filter(Boolean).length
+    return delivered / total
   }
 
   shouldAutoPause(): boolean {

@@ -1,5 +1,21 @@
 import type { RateLimitState } from '../core/types.js'
 
+export interface RateLimiterConfig {
+  perMinute: number
+  perHour: number
+  perDay: number
+  minDelayMs: number
+  maxDelayMs: number
+  /** Extra delay for first message to new chat. Default: 2500 */
+  newChatDelayMs?: number
+  /** Fast messages before rate limiting kicks in. Default: 3 */
+  burstAllowance?: number
+  /** Max identical messages in window. Default: 5 */
+  maxIdenticalMessages?: number
+  /** Window for identical message tracking (ms). Default: 3600000 */
+  identicalMessageWindowMs?: number
+}
+
 export class RateLimiter {
   private state: RateLimitState
   private limits: {
@@ -9,15 +25,26 @@ export class RateLimiter {
     minDelayMs: number
     maxDelayMs: number
   }
+  private newChatDelayMs: number
+  private burstAllowance: number
+  private maxIdenticalMessages: number
+  private identicalMessageWindowMs: number
+  private sentInMinute = 0
+  private identicalTracker = new Map<string, number[]>() // text -> timestamps
+  private knownChats = new Set<string>()
 
-  constructor(config: {
-    perMinute: number
-    perHour: number
-    perDay: number
-    minDelayMs: number
-    maxDelayMs: number
-  }) {
-    this.limits = config
+  constructor(config: RateLimiterConfig) {
+    this.limits = {
+      perMinute: config.perMinute,
+      perHour: config.perHour,
+      perDay: config.perDay,
+      minDelayMs: config.minDelayMs,
+      maxDelayMs: config.maxDelayMs,
+    }
+    this.newChatDelayMs = config.newChatDelayMs ?? 2500
+    this.burstAllowance = config.burstAllowance ?? 3
+    this.maxIdenticalMessages = config.maxIdenticalMessages ?? 5
+    this.identicalMessageWindowMs = config.identicalMessageWindowMs ?? 3_600_000
     this.state = this.initState()
   }
 
@@ -62,8 +89,14 @@ export class RateLimiter {
    * Check if we can send and compute delay with Gaussian jitter.
    * Returns { allowed, delayMs, reason? }
    */
-  canSend(): { allowed: boolean; delayMs: number; reason?: string } {
+  canSend(text?: string, isNewChat?: boolean): { allowed: boolean; delayMs: number; reason?: string } {
     this.resetIfNeeded()
+
+    // Burst allowance: first N messages skip rate limit check
+    if (this.state.sentMinute < this.burstAllowance) {
+      const delayMs = this.computeDelay(text, isNewChat)
+      return { allowed: true, delayMs }
+    }
 
     if (this.state.sentMinute >= this.limits.perMinute) {
       return { allowed: false, delayMs: 0, reason: 'per-minute limit reached' }
@@ -75,15 +108,66 @@ export class RateLimiter {
       return { allowed: false, delayMs: 0, reason: 'per-day limit reached' }
     }
 
-    const delayMs = this.gaussianDelay()
+    // Identical message detection
+    if (text && this.isIdenticalBlocked(text)) {
+      return { allowed: false, delayMs: 0, reason: 'identical message limit reached' }
+    }
+
+    const delayMs = this.computeDelay(text, isNewChat)
     return { allowed: true, delayMs }
   }
 
-  record(): void {
+  private computeDelay(text?: string, isNewChat?: boolean): number {
+    let delay = this.gaussianDelay()
+
+    // New chat penalty
+    if (isNewChat) {
+      delay += this.newChatDelayMs
+    }
+
+    // Typing-based delay: ~30ms per character
+    if (text && text.length > 20) {
+      delay += text.length * 30
+    }
+
+    return delay
+  }
+
+  private isIdenticalBlocked(text: string): boolean {
+    const normalized = text.trim().toLowerCase()
+    const now = Date.now()
+    const timestamps = this.identicalTracker.get(normalized) ?? []
+    const recent = timestamps.filter(t => now - t < this.identicalMessageWindowMs)
+    this.identicalTracker.set(normalized, recent)
+    return recent.length >= this.maxIdenticalMessages
+  }
+
+  /**
+   * Register a chat as known (for new-chat delay tracking).
+   */
+  markKnownChat(jid: string): void {
+    this.knownChats.add(jid)
+  }
+
+  /**
+   * Check if a chat is new.
+   */
+  isNewChat(jid: string): boolean {
+    return !this.knownChats.has(jid)
+  }
+
+  record(text?: string): void {
     this.resetIfNeeded()
     this.state.sentMinute++
     this.state.sentHour++
     this.state.sentDay++
+
+    if (text) {
+      const normalized = text.trim().toLowerCase()
+      const timestamps = this.identicalTracker.get(normalized) ?? []
+      timestamps.push(Date.now())
+      this.identicalTracker.set(normalized, timestamps)
+    }
   }
 
   getState(): RateLimitState {

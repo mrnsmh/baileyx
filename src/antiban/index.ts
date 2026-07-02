@@ -4,6 +4,12 @@ import { RateLimiter } from './rate-limiter.js'
 import { WarmUp } from './warmup.js'
 import { HealthMonitor } from './health.js'
 import { PresenceSimulator } from './presence.js'
+import { ContactGraph } from './contact-graph.js'
+import { DeliveryTracker } from './delivery-tracker.js'
+import { ReconnectThrottle } from './reconnect-throttle.js'
+import { LegitimacyInjector } from './legitimacy.js'
+import { getCircadianMultiplier, type CircadianProfile } from './circadian.js'
+import { classifyDisconnect } from './disconnect-classifier.js'
 
 export interface AntiBanConfig {
   preset?: 'minimal' | 'balanced' | 'maximum'
@@ -19,6 +25,18 @@ export interface AntiBanConfig {
   typingIndicators?: boolean
   readReceipts?: boolean
   presenceUpdates?: boolean
+  /** Enable contact graph enforcement. Default: true */
+  contactGraph?: boolean
+  /** Enable delivery tracking. Default: true */
+  deliveryTracking?: boolean
+  /** Enable post-reconnect throttle. Default: true */
+  reconnectThrottle?: boolean
+  /** Enable legitimacy signals (typos, read gaps). Default: true */
+  legitimacySignals?: boolean
+  /** Circadian profile. Default: 'default' */
+  circadianProfile?: CircadianProfile
+  /** Timezone for circadian timing. Default: 'UTC' */
+  timezone?: string
 }
 
 const PRESETS: Record<string, Partial<AntiBanConfig>> = {
@@ -60,6 +78,10 @@ export class AntiBan {
   private warmUp: WarmUp
   private healthMonitor: HealthMonitor
   private presence?: PresenceSimulator
+  private contactGraph?: ContactGraph
+  private deliveryTracker?: DeliveryTracker
+  private reconnectThrottle?: ReconnectThrottle
+  private legitimacy?: LegitimacyInjector
   private paused = false
   private pauseReason?: string
   private messageStats = { total: 0, blocked: 0, allowed: 0 }
@@ -88,6 +110,26 @@ export class AntiBan {
     this.healthMonitor = new HealthMonitor({
       autoPauseAt: merged.autoPauseAt,
     })
+
+    if (merged.contactGraph !== false) {
+      this.contactGraph = new ContactGraph()
+    }
+
+    if (merged.deliveryTracking !== false) {
+      this.deliveryTracker = new DeliveryTracker({
+        onLowRate: (rate) => {
+          console.warn(`[whtsp] Low delivery rate: ${(rate * 100).toFixed(1)}%`)
+        },
+      })
+    }
+
+    if (merged.reconnectThrottle !== false) {
+      this.reconnectThrottle = new ReconnectThrottle()
+    }
+
+    if (merged.legitimacySignals !== false) {
+      this.legitimacy = new LegitimacyInjector()
+    }
   }
 
   /**
@@ -103,8 +145,17 @@ export class AntiBan {
     // Hook into events
     sock.ev.on('connection.update', (update) => {
       if (update.connection === 'close') {
-        const reason = (update.lastDisconnect?.error as any)?.output?.statusCode
-        this.healthMonitor.onDisconnect(String(reason))
+        const statusCode = (update.lastDisconnect?.error as any)?.output?.statusCode
+        const classification = classifyDisconnect(statusCode)
+        this.healthMonitor.onDisconnect(classification.message)
+
+        if (classification.category === 'rate-limited') {
+          this.healthMonitor.onForbidden()
+        }
+      }
+
+      if (update.connection === 'open') {
+        this.reconnectThrottle?.onReconnect()
       }
     })
   }
@@ -160,8 +211,24 @@ export class AntiBan {
       }
     }
 
-    // 4. Check rate limiter
-    const rateCheck = this.rateLimiter.canSend()
+    // 4. Check contact graph
+    const isNewChat = this.contactGraph ? !this.contactGraph['contacts'].has(jid) : this.rateLimiter.isNewChat(jid)
+    if (this.contactGraph) {
+      const contactCheck = this.contactGraph.canMessage(jid)
+      if (!contactCheck.allowed) {
+        this.messageStats.blocked++
+        return {
+          allowed: false,
+          delayMs: 0,
+          reason: contactCheck.reason,
+          health,
+          warmupDay: this.warmUp.getState().day,
+        }
+      }
+    }
+
+    // 5. Check rate limiter
+    const rateCheck = this.rateLimiter.canSend(content, isNewChat)
     if (!rateCheck.allowed) {
       this.messageStats.blocked++
       return {
@@ -173,7 +240,32 @@ export class AntiBan {
       }
     }
 
-    // 5. Simulate presence (typing indicator)
+    // 6. Compute final delay with all factors
+    let delayMs = rateCheck.delayMs
+
+    // Contact graph multiplier
+    if (this.contactGraph) {
+      const multiplier = this.contactGraph.getDelayMultiplier(jid)
+      delayMs = Math.round(delayMs * multiplier)
+    }
+
+    // Circadian multiplier
+    if (this.config.circadianProfile && this.config.circadianProfile !== 'always_on') {
+      const circadianMult = getCircadianMultiplier(new Date(), this.config.circadianProfile, this.config.timezone)
+      delayMs = Math.round(delayMs * circadianMult)
+    }
+
+    // Reconnect throttle
+    if (this.reconnectThrottle) {
+      delayMs = this.reconnectThrottle.applyThrottle(delayMs)
+    }
+
+    // 7. Legitimacy signals (read gap before responding)
+    if (this.legitimacy && this.legitimacy.shouldReadGap()) {
+      delayMs += this.legitimacy.getReadGapDelay()
+    }
+
+    // 8. Simulate presence (typing indicator)
     if (this.presence && content) {
       await this.presence.preSend(jid)
     }
@@ -181,7 +273,7 @@ export class AntiBan {
     this.messageStats.allowed++
     return {
       allowed: true,
-      delayMs: rateCheck.delayMs,
+      delayMs,
       health,
       warmupDay: this.warmUp.getState().day,
     }
@@ -190,10 +282,17 @@ export class AntiBan {
   /**
    * Record a successful send.
    */
-  afterSend(jid: string): void {
-    this.rateLimiter.record()
+  afterSend(jid: string, text?: string, messageId?: string): void {
+    this.rateLimiter.record(text)
     this.warmUp.record()
     this.healthMonitor.onMessageSuccess()
+    this.contactGraph?.onOutgoingMessage(jid)
+    this.rateLimiter.markKnownChat(jid)
+
+    if (messageId && this.deliveryTracker) {
+      this.deliveryTracker.onMessageSent(messageId)
+      this.healthMonitor.onMessageSent(messageId)
+    }
 
     if (this.presence) {
       this.presence.postSend(jid).catch(() => {})
@@ -212,6 +311,37 @@ export class AntiBan {
    */
   onForbidden(): void {
     this.healthMonitor.onForbidden()
+  }
+
+  /**
+   * Record an incoming message (for contact graph tracking).
+   */
+  onIncomingMessage(jid: string): void {
+    this.contactGraph?.onIncomingMessage(jid)
+
+    // Mark handshake complete if contact replied
+    if (this.contactGraph) {
+      const info = this.contactGraph['contacts'].get(jid)
+      if (info && info.relation === 'handshake_sent') {
+        this.contactGraph.markHandshakeComplete(jid)
+      }
+      this.contactGraph.markKnown(jid)
+    }
+  }
+
+  /**
+   * Record a delivery receipt.
+   */
+  onDeliveryReceipt(messageId: string): void {
+    this.deliveryTracker?.onDeliveryReceipt(messageId)
+    this.healthMonitor.onDeliveryReceipt(messageId)
+  }
+
+  /**
+   * Vary a message to avoid identical detection.
+   */
+  varyMessage(text: string): string {
+    return this.legitimacy?.varyMessage(text) ?? text
   }
 
   // ─── State ─────────────────────────────────────────────────────────
@@ -266,5 +396,6 @@ export class AntiBan {
   // ─── Cleanup ───────────────────────────────────────────────────────
   destroy(): void {
     this.presence?.stopPresenceCycling()
+    this.deliveryTracker?.cleanup()
   }
 }
